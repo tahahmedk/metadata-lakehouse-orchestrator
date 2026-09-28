@@ -1,0 +1,31 @@
+[
+  {
+    "name": "bronze_orders",
+    "depends_on": [],
+    "estimated_minutes": 4.0,
+    "kind": "incremental"
+  },
+  {
+    "name": "bronze_customers",
+    "depends_on": [],
+    "estimated_minutes": 3.0,
+    "kind": "incremental"
+  },
+  {
+    "name": "silver_orders",
+    "depends_on": [
+      "bronze_orders",
+      "bronze_customers"
+    ],
+    "estimated_minutes": 8.0,
+    "kind": "incremental"
+  },
+  {
+    "name": "gold_sales_metrics",
+    "depends_on": [
+      "silver_orders"
+    ],
+    "estimated_minutes": 5.0,
+    "kind": "incremental"
+  }
+]
