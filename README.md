@@ -1,14 +1,28 @@
 # Metadata Lakehouse Orchestrator
 
-A local orchestration control plane that turns workload metadata into a validated,
-restartable DAG execution. It focuses on **who may execute a pipeline, which upstream
-results it depends on, and when an incremental checkpoint may advance**.
+A metadata-driven DAG executor backed by SQLite. The implementation is local;
+the design question is how ownership and progress survive retries and partial failure.
 
-A loop over ETL jobs cannot resolve concurrent ownership, partial failure, replay and
-incremental progress. Here those decisions are explicit state transitions backed by
-SQLite. The data plane is an injected handler, so the demo needs no cloud account.
+## Why I built this
 
-## Architecture
+Retries look straightforward until they interact with dependencies, concurrent runs
+and incremental checkpoints. I wanted a small system where I could interrupt that
+sequence and inspect what the next attempt is allowed to do. This project puts the
+work into orchestration state and ownership rather than inventing another pipeline
+syntax.
+
+## Invariants before scheduling
+
+1. One pipeline has one active owner in a shared local state store.
+2. A child runs only after all parents have recorded success, including a replay skip.
+3. Failed attempts do not advance the checkpoint; success and its watermark commit together.
+4. Reusing a logical run with different metadata or a different window is an error.
+
+These are control-plane guarantees. They do not make an external sink write atomic
+with the state store. [ADR-002 explains why orchestration state lives outside the task handler](docs/ADR-002-state-ownership.md),
+and what the handler still has to guarantee.
+
+## Execution model
 
 ```mermaid
 flowchart TD
@@ -41,7 +55,28 @@ flowchart TD
   immediately. Metadata classifies workloads for a future backend; classification
   currently does not reserve CPU, prioritize queues or choose cloud compute.
 
-## Run and test
+## Failure semantics
+
+| Failure | Result |
+| --- | --- |
+| Invalid graph/configuration | No task starts |
+| Transient handler error | Retry same window; bounded backoff |
+| Permanent error or exhausted retries | FAILED, checkpoint unchanged, descendants BLOCKED |
+| Concurrent pipeline owner | BUSY; descendants BLOCKED |
+| Crash with active claim | Claim remains; operator recovery required |
+| State commit fails after side effect | Claim retained; reconcile sink before recovery |
+| Reuse run ID with changed metadata | Rejected |
+
+**Exactly-once side effects are not guaranteed.** A worker can finish a sink write and
+crash before recording success. Handlers must merge/upsert or deduplicate using a stable
+business key or `(run_id, pipeline)`. Retrying alone does not make a sink idempotent.
+
+A successful same-run replay is skipped. If a failed window has been superseded by
+another run's watermark, it cannot be replayed under the old identity. Do not reuse a
+run ID for a new graph or different handler implementation: the fingerprint covers
+metadata, not Python handler code.
+
+## Try a run, then replay it
 
 Python 3.11–3.13:
 
@@ -64,28 +99,7 @@ Tests cover retries, restarts, durable watermarks, simultaneous claims, parallel
 blocked descendants, explicit recovery and incompatible replay. CI also checks lint,
 formatting and the demo across three Python versions.
 
-## Failure semantics
-
-| Failure | Result |
-| --- | --- |
-| Invalid graph/configuration | No task starts |
-| Transient handler error | Retry same window; bounded backoff |
-| Permanent error or exhausted retries | FAILED, checkpoint unchanged, descendants BLOCKED |
-| Concurrent pipeline owner | BUSY; descendants BLOCKED |
-| Crash with active claim | Claim remains; operator recovery required |
-| State commit fails after side effect | Claim retained; reconcile sink before recovery |
-| Reuse run ID with changed metadata | Rejected |
-
-**Exactly-once side effects are not guaranteed.** A worker can finish a sink write and
-crash before recording success. Handlers must merge/upsert or deduplicate using a stable
-business key or `(run_id, pipeline)`. Retrying alone does not make a sink idempotent.
-
-A successful same-run replay is skipped. If a failed window has been superseded by
-another run's watermark, it cannot be replayed under the old identity. Do not reuse a
-run ID for a new graph or different handler implementation: the fingerprint covers
-metadata, not Python handler code.
-
-## Operations, trade-offs and evolution
+## Operating this version
 
 Audit events expose pipeline, run ID, attempt and status without storing exception
 messages or source records. JSON success events are emitted through Python logging.
@@ -96,8 +110,9 @@ SQLite provides inspectable local transactions and serialized state writes; it i
 a distributed scheduler database and should not live on a network filesystem. The
 scheduler is one process with threads; it does not interrupt hung handlers or provide
 leases/heartbeats. Claims require explicit recovery after the old worker is stopped.
-A production backend would add fenced leases, handler cancellation, durable dispatch,
-shared transactional storage and backend-specific idempotent sinks.
+I would establish fenced ownership before adding remote workers. The
+[future-work plan](FUTURE_WORK.md) starts with a Postgres state backend, then fenced
+leases and durable dispatch; none of those capabilities is present yet.
 
-All examples are independent clean-room implementations using synthetic offsets,
-workloads and generic architecture patterns. No employer source or confidential data.
+An independent clean-room implementation with synthetic offsets and workloads.
+No employer code or confidential data is used, and no production deployment is claimed.
